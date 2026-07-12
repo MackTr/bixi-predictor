@@ -1,0 +1,35 @@
+name = "bixi-predictor"
+main = "src/worker.ts"
+compatibility_date = "2025-01-01"
+
+# 9pm America/Toronto is 01:00 UTC during EDT and 02:00 UTC during EST. Both
+# crons fire year-round; scheduled() runs the pipeline only when the local hour
+# is 21, so exactly one firing does work each night (DST-proof).
+[triggers]
+crons = ["0 1 * * *", "0 2 * * *"]
+
+# D1 (SQLite). For local dev wrangler uses a local copy and ignores database_id.
+# Before `wrangler deploy`: run `wrangler d1 create bixi_predictor` and paste the
+# real database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "bixi_predictor"
+database_id = "1cc4a56d-e79c-438c-b8d7-90dcc35e1e94"
+
+# The predictor is client #2 of bixi-monitor's public API — it never touches the
+# monitor's D1. In production the API calls go through this service binding,
+# because workers.dev blocks worker→worker fetches within one account (error
+# 1042 dressed as a 404); the request still hits the monitor's public /api/v1
+# handler, so the contract stays the boundary. Local dev falls back to the
+# public MONITOR_API URL.
+[[services]]
+binding = "MONITOR"
+service = "bixi-monitor"
+
+# Secrets (not listed here): VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, ADMIN_TOKEN —
+# set with `wrangler secret put`, or .dev.vars locally.
+[vars]
+MONITOR_API = "https://bixi-monitor.bixi.workers.dev/api/v1"
+STATION_ID = "345"
+STATION_LAT = "45.46734390596128"
+STATION_LON = "-73.57078850269318"

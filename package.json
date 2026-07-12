@@ -1,0 +1,19 @@
+{
+  "name": "bixi-predictor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nightly run-out prediction + push notifications for BIXI station 345, on Cloudflare Workers + D1. Client #2 of bixi-monitor's API.",
+  "scripts": {
+    "dev": "wrangler dev --port 8788 --test-scheduled",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc",
+    "db:migrate:local": "wrangler d1 migrations apply bixi_predictor --local",
+    "db:migrate": "wrangler d1 migrations apply bixi_predictor --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260708.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  }
+}
