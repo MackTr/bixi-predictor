@@ -110,7 +110,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (seg[0] === "admin") {
       if (!authorized(request, env)) return fail(401, "unauthorized");
       if (!GET && seg[1] === "backfill") {
-        return json(await backfill(env, clampDays(url.searchParams.get("days"), 20)));
+        const force = url.searchParams.get("force") === "1";
+        return json(await backfill(env, clampDays(url.searchParams.get("days"), 20), { force }));
       }
       if (!GET && seg[1] === "run") {
         return json(await runNightly(env, { push: url.searchParams.get("push") === "1" }));

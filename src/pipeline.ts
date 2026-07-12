@@ -37,12 +37,18 @@ interface FeatureRow {
   complete: number;
   temp_c: number | null;
   precip_mm: number | null;
+  start_bikes: number | null;
 }
 
 async function loadHistory(env: Env): Promise<DayRecord[]> {
+  // A day starts its morning from the PREVIOUS evening's 9pm inventory — hence
+  // the self-join on date-1.
   const res = await env.DB.prepare(
-    `SELECT f.date, f.dow, f.is_holiday, f.runout_minutes, f.obs_count, f.complete, w.temp_c, w.precip_mm
-     FROM daily_features f LEFT JOIN weather_daily w ON w.date = f.date
+    `SELECT f.date, f.dow, f.is_holiday, f.runout_minutes, f.obs_count, f.complete,
+            w.temp_c, w.precip_mm, p.evening_bikes AS start_bikes
+     FROM daily_features f
+     LEFT JOIN weather_daily w ON w.date = f.date
+     LEFT JOIN daily_features p ON p.date = date(f.date, '-1 day')
      ORDER BY f.date ASC`,
   ).all<FeatureRow>();
   return (res.results ?? []).map((r) => ({
@@ -52,6 +58,7 @@ async function loadHistory(env: Env): Promise<DayRecord[]> {
     runoutMinutes: r.runout_minutes,
     tempC: r.temp_c,
     precipMm: r.precip_mm,
+    startBikes: r.start_bikes,
     complete: !!r.complete,
     obsCount: r.obs_count,
   }));
@@ -85,6 +92,11 @@ export async function buildAndStorePrediction(env: Env, targetDate: string, now:
   const weather = await env.DB.prepare(`SELECT temp_c, precip_mm, precip_prob FROM weather_daily WHERE date = ?`)
     .bind(targetDate)
     .first<{ temp_c: number | null; precip_mm: number | null; precip_prob: number | null }>();
+  // Tomorrow starts from tonight's inventory — today's 9pm snapshot, captured by
+  // the sync step that just ran.
+  const tonight = await env.DB.prepare(`SELECT evening_bikes FROM daily_features WHERE date = ?`)
+    .bind(addDays(targetDate, -1))
+    .first<{ evening_bikes: number | null }>();
   const target: TargetContext = {
     date: targetDate,
     dow: dowOf(targetDate),
@@ -92,6 +104,7 @@ export async function buildAndStorePrediction(env: Env, targetDate: string, now:
     tempC: weather?.temp_c ?? null,
     precipMm: weather?.precip_mm ?? null,
     precipProb: weather?.precip_prob ?? null,
+    startBikes: tonight?.evening_bikes ?? null,
   };
   const prediction = predict(history, target);
   await env.DB.prepare(
@@ -193,6 +206,7 @@ export async function runNightly(env: Env, opts: { push: boolean; now?: number }
           predictedMinutes: p.predictedMinutes,
           windowEarly: p.windowEarly,
           windowLate: p.windowLate,
+          startBikes: p.basis.target.startBikes,
         },
         todayPred ? { predictedMinutes: todayPred.predicted_minutes, actualMinutes: todayFact?.runout_minutes ?? null } : undefined,
       );
@@ -204,9 +218,11 @@ export async function runNightly(env: Env, opts: { push: boolean; now?: number }
 }
 
 // First-deploy / repair path: digest N days of history + weather actuals without
-// forecasting, predicting, or pushing.
-export async function backfill(env: Env, days: number, nowArg?: number): Promise<PipelineResult> {
-  const now = nowArg ?? Math.floor(Date.now() / 1000);
+// forecasting, predicting, or pushing. `force` re-syncs days already marked
+// complete — needed when a new derived column (e.g. evening_bikes) must be
+// filled for existing history.
+export async function backfill(env: Env, days: number, opts?: { force?: boolean; now?: number }): Promise<PipelineResult> {
+  const now = opts?.now ?? Math.floor(Date.now() / 1000);
   const today = localToday(now);
   const result: PipelineResult = {
     today,
@@ -220,7 +236,13 @@ export async function backfill(env: Env, days: number, nowArg?: number): Promise
     errors: [],
   };
   try {
-    const need = await datesNeedingSync(env, days, today);
+    let need: string[];
+    if (opts?.force) {
+      need = [];
+      for (let d = addDays(today, -days); d <= today; d = addDays(d, 1)) need.push(d);
+    } else {
+      need = await datesNeedingSync(env, days, today);
+    }
     result.synced = (await syncDays(env, need, now)).map((d) => d.date);
   } catch (e) {
     result.errors.push(`sync: ${e instanceof Error ? e.message : String(e)}`);

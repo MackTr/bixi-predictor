@@ -29,12 +29,17 @@ Each past day gets a weight: the product of four kernels comparing it to tomorro
 | kernel | compares | value |
 |---|---|---|
 | day type | weekday vs work/off class | same dow **and** same class 1.0 · same class 0.4 · opposite 0.05 |
+| starting inventory | bikes at 9pm the evening before | gaussian on the difference, σ = 4 bikes |
 | temperature | 8am temperature | gaussian on the difference, σ = 5 °C |
 | precipitation | 6–11am rain sum | buckets dry <0.5mm / light / wet >4mm: same 1.0 · adjacent 0.5 · dry↔wet 0.15 |
 | recency | calendar age | half-life 45 days |
 
 Details that matter:
 
+- **Starting inventory is symmetric by construction**: tomorrow's is tonight's live 9pm count
+  (known at prediction time); a history day's is *its* previous evening's 9pm snapshot. A station
+  sitting at 6 bikes at 9pm gets its estimate pulled toward past days that also started low —
+  which ran out earlier. The nightly notification reports the count it reasoned from.
 - **Holidays are off-days**, not excluded: a holiday Monday matches Sundays (class `offday`), never
   working Mondays. Quebec statutory holidays are computed, not maintained ([src/holidays.ts](src/holidays.ts)).
 - **Missing weather is uninformative, not dissimilar** — a null temperature scores kernel 1.0, so a
@@ -64,9 +69,10 @@ The effective sample size `n_eff = (Σw)²/Σw²` measures how many days the est
 on. When it's under 3, the model climbs a fallback ladder instead of faking precision:
 
 1. **Level 0** — all kernels active.
-2. **Level 1** — weather kernels dropped (with little data, weather-matching starves the sample).
-3. **Level 2** — day-type kernel widened (1.0/0.7/0.2). If `n_eff` is still under 1, the
-   prediction is published as **"not enough data"** rather than a made-up time.
+2. **Level 1** — weather kernels dropped (with little data, weather-matching starves the sample);
+   inventory survives, it's too informative to give up early.
+3. **Level 2** — day-type kernel widened (1.0/0.7/0.2) and inventory dropped. If `n_eff` is still
+   under 1, the prediction is published as **"not enough data"** rather than a made-up time.
 
 The level used is stored and shown on the dashboard card, so a vague answer is visibly vague.
 
@@ -79,10 +85,11 @@ notification also reports how yesterday's prediction did.
 
 ### Explainability
 
-`basis_json` on every prediction records the fallback level, `n_eff`, the full parameter set, and
-the top-8 contributing days with their weights, run-out times and weather. Any prediction can be
-audited months later: *these* were the days it reasoned from, weighted *this* much, under *these*
-parameters.
+`basis_json` on every prediction records the fallback level, `n_eff`, the target-day context it
+compared against (day type, forecast, tonight's bike count), the full parameter set, and the top-8
+contributing days with their weights, run-out times, weather and starting inventory. Any prediction
+can be audited months later: *these* were the days it reasoned from, weighted *this* much, under
+*these* parameters.
 
 ## The nightly pipeline
 

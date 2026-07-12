@@ -5,7 +5,7 @@
 // transition of the local day.
 
 import type { Env } from "./worker";
-import { TZ, addDays, dayDiff, dowOf, localParts, localToday, midnightEpoch } from "./tz";
+import { TZ, addDays, dayDiff, dowOf, localParts, localToday, midnightEpoch, wallToEpoch } from "./tz";
 import { holidayName } from "./holidays";
 
 export interface MonitorObs {
@@ -18,19 +18,22 @@ export interface SyncedDay {
   runoutMinutes: number | null;
   obsCount: number;
   complete: boolean;
+  eveningBikes: number | null;
 }
 
 // workers.dev blocks worker→worker fetches within one account, so production
 // goes through the MONITOR service binding (still the public /api/v1 handler,
-// just routed directly). Local dev has no bound monitor — fall back to a plain
-// fetch of the live URL, which works fine from outside Cloudflare.
+// just routed directly). Local dev has no bound monitor: wrangler's stub either
+// throws or answers 503, and either way the plain fetch of the live URL works
+// fine from outside Cloudflare — fall back on both.
 async function monitorFetch(env: Env, url: string): Promise<Response> {
   const init = { headers: { "User-Agent": "bixi-predictor (personal)" } };
   if (env.MONITOR) {
     try {
-      return await env.MONITOR.fetch(url, init);
+      const res = await env.MONITOR.fetch(url, init);
+      if (res.status !== 503) return res;
     } catch {
-      /* binding unavailable (local dev) — use the public URL */
+      /* fall through to the public URL */
     }
   }
   return fetch(url, init);
@@ -89,7 +92,14 @@ export async function syncDays(env: Env, dates: string[], now: number): Promise<
     if (to <= from) continue;
     const rows = await fetchObservations(env, from, to);
 
-    const state = new Map(run.map((d) => [d, { runoutEpoch: null as number | null, obs: 0 }]));
+    // 21:00 snapshot per date: last observed value at or before 9pm (step-held).
+    const eveningEpochs = run.map((d) => {
+      const [y, m, dd] = d.split("-").map(Number);
+      return wallToEpoch(y, m, dd, 21, 0, TZ);
+    });
+    const state = new Map(
+      run.map((d) => [d, { runoutEpoch: null as number | null, obs: 0, eveningBikes: null as number | null }]),
+    );
     let prev: number | null = null;
     let di = -1; // index into run; -1 = still in the 2h lead-in
     for (const r of rows) {
@@ -98,6 +108,7 @@ export async function syncDays(env: Env, dates: string[], now: number): Promise<
         const st = state.get(run[di])!;
         st.obs++;
         if (prev != null && prev > 0 && r.bikes <= 0 && st.runoutEpoch == null) st.runoutEpoch = r.ts;
+        if (r.ts <= eveningEpochs[di]) st.eveningBikes = r.bikes;
       }
       prev = r.bikes;
     }
@@ -113,19 +124,20 @@ export async function syncDays(env: Env, dates: string[], now: number): Promise<
           : null;
       const complete = date < today;
       await env.DB.prepare(
-        `INSERT INTO daily_features (date, dow, is_holiday, runout_minutes, obs_count, complete, synced_ts)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO daily_features (date, dow, is_holiday, runout_minutes, obs_count, complete, evening_bikes, synced_ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(date) DO UPDATE SET
            dow = excluded.dow,
            is_holiday = excluded.is_holiday,
            runout_minutes = excluded.runout_minutes,
            obs_count = excluded.obs_count,
            complete = excluded.complete,
+           evening_bikes = COALESCE(excluded.evening_bikes, daily_features.evening_bikes),
            synced_ts = excluded.synced_ts`,
       )
-        .bind(date, dowOf(date), holidayName(date) ? 1 : 0, runoutMinutes, st.obs, complete ? 1 : 0, now)
+        .bind(date, dowOf(date), holidayName(date) ? 1 : 0, runoutMinutes, st.obs, complete ? 1 : 0, st.eveningBikes, now)
         .run();
-      out.push({ date, runoutMinutes, obsCount: st.obs, complete });
+      out.push({ date, runoutMinutes, obsCount: st.obs, complete, eveningBikes: st.eveningBikes });
     }
   }
   return out;

@@ -26,8 +26,9 @@ Latest prediction (or the one for an exact target date). 404 until the first nig
 `willRunOut` is `null` when the model had too little data; `probability < 0.5` ⇒ `willRunOut: false`
 with `predicted: null` (the median it would have picked is kept in `basis.medianEvenIfUnlikely`).
 `window` is the weighted P25–P75 of similar days' run-out times. `basis` explains the estimate:
-fallback level (0 = full kernels, 1 = weather dropped, 2 = day-type widened), effective sample
-size, and the top contributing days with their weights.
+fallback level (0 = full kernels, 1 = weather dropped, 2 = day-type widened + inventory dropped),
+effective sample size, the target context it compared against (`basis.target`, including
+`startBikes` — tonight's 9pm inventory), and the top contributing days with their weights.
 ```json
 { "station": "345", "targetDate": "2026-07-11", "createdAt": "2026-07-11T01:00:05Z",
   "willRunOut": true, "probability": 0.86,
@@ -61,7 +62,8 @@ home-screen app) are pruned automatically on the next send.
 
 ### Admin (require `Authorization: Bearer <ADMIN_TOKEN>`)
 - `POST /admin/backfill?days=N` — digest N days of monitor history + weather actuals (idempotent;
-  skips already-complete days). Run once after first deploy.
+  skips already-complete days). Run once after first deploy. `&force=1` re-syncs complete days too
+  (used to fill a newly added derived column for existing history).
 - `POST /admin/run?push=0|1` — run the nightly pipeline now, bypassing the 9pm guard. `push`
   defaults to 0; even with `push=1` a target date is never notified twice.
 - `POST /admin/test-push` — send a canned notification to every subscription.

@@ -15,6 +15,7 @@ export interface DayRecord {
   runoutMinutes: number | null; // null = never ran out that day
   tempC: number | null; // 08:00 temperature
   precipMm: number | null; // 06:00-11:00 precipitation sum
+  startBikes: number | null; // bikes at 9pm the evening before — the day's starting inventory
   complete: boolean;
   obsCount: number;
 }
@@ -26,6 +27,7 @@ export interface TargetContext {
   tempC: number | null;
   precipMm: number | null;
   precipProb: number | null; // forecast-only signal, promotes a dry mm bucket
+  startBikes: number | null; // bikes right now — what tomorrow morning starts from
 }
 
 export interface WeightedDay {
@@ -34,14 +36,16 @@ export interface WeightedDay {
   runoutMinutes: number | null;
   tempC: number | null;
   precipMm: number | null;
+  startBikes: number | null;
 }
 
 export interface PredictionBasis {
-  fallbackLevel: 0 | 1 | 2; // 0 = full kernels, 1 = weather dropped, 2 = day-type widened too
+  fallbackLevel: 0 | 1 | 2; // 0 = full kernels, 1 = weather dropped, 2 = day-type widened + inventory dropped
   effectiveWeight: number; // sum of weights
   effectiveN: number; // (sum w)^2 / sum w^2 — "how many days is this really"
   historyDays: number; // records that passed the obs_count gate
   medianEvenIfUnlikely: number | null; // kept when probability < pMin
+  target: TargetContext; // what tomorrow looked like when the model reasoned about it
   params: Params;
   topDays: WeightedDay[]; // top contributors, heaviest first
 }
@@ -56,6 +60,7 @@ export interface Prediction {
 
 export const PARAMS = {
   tempSigmaC: 5,
+  bikesSigma: 4, // starting-inventory kernel width, in bikes (capacity is 19)
   recencyHalfLifeDays: 45,
   dryMaxMm: 0.5, // precip buckets over the morning-window sum
   wetMinMm: 4,
@@ -77,8 +82,9 @@ function dayTypeKernel(d: DayRecord, t: TargetContext, widened: boolean): number
   return sameDow && sameClass ? 1.0 : sameClass ? 0.4 : 0.05;
 }
 
-// Missing weather is uninformative, not dissimilar — kernel 1.
-function tempKernel(a: number | null, b: number | null, sigma: number): number {
+// Gaussian similarity on a numeric feature (temperature, starting inventory).
+// A missing value is uninformative, not dissimilar — kernel 1.
+function gaussianKernel(a: number | null, b: number | null, sigma: number): number {
   if (a == null || b == null) return 1;
   const d = a - b;
   return Math.exp(-(d * d) / (2 * sigma * sigma));
@@ -118,9 +124,13 @@ export function predict(history: DayRecord[], target: TargetContext, params: Par
     usable.map((d) => {
       let w = dayTypeKernel(d, target, level === 2);
       if (level === 0) {
-        w *= tempKernel(d.tempC, target.tempC, params.tempSigmaC);
+        w *= gaussianKernel(d.tempC, target.tempC, params.tempSigmaC);
         w *= precipKernel(d, target, params);
       }
+      // Starting inventory is a strong signal (a station at 6 bikes at 9pm runs
+      // out earlier than a full one), so it survives level 1 and is only dropped
+      // in the last-resort widening at level 2.
+      if (level <= 1) w *= gaussianKernel(d.startBikes, target.startBikes, params.bikesSigma);
       w *= Math.pow(0.5, dayDiffDays(d.date, target.date) / params.recencyHalfLifeDays);
       return { d, w };
     });
@@ -152,6 +162,7 @@ export function predict(history: DayRecord[], target: TargetContext, params: Par
       runoutMinutes: d.runoutMinutes,
       tempC: d.tempC,
       precipMm: d.precipMm,
+      startBikes: d.startBikes,
     }));
 
   const basis: PredictionBasis = {
@@ -160,6 +171,7 @@ export function predict(history: DayRecord[], target: TargetContext, params: Par
     effectiveN: Math.round(nEff * 100) / 100,
     historyDays: usable.length,
     medianEvenIfUnlikely: null,
+    target,
     params,
     topDays,
   };

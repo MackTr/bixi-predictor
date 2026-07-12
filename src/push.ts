@@ -26,6 +26,7 @@ export interface PredictionSummary {
   predictedMinutes: number | null;
   windowEarly: number | null;
   windowLate: number | null;
+  startBikes?: number | null; // tonight's 9pm inventory, when known
 }
 
 export interface TodayComparison {
@@ -57,6 +58,9 @@ export function buildNotification(p: PredictionSummary, today?: TodayComparison)
         ? ` likely out ${minsToHHMM(p.windowEarly)}–${minsToHHMM(p.windowLate)}`
         : ` likely out ~${minsToHHMM(p.predictedMinutes)}`;
     body = `${friendlyDate(p.targetDate)} ·${win} (${Math.round(p.probability * 100)}%).`;
+  }
+  if (p.startBikes != null) {
+    body += ` From ${p.startBikes} bike${p.startBikes === 1 ? "" : "s"} tonight.`;
   }
   if (today?.predictedMinutes != null) {
     body += ` Today: predicted ${minsToHHMM(today.predictedMinutes)}, actual ${
