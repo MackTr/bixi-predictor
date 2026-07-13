@@ -53,11 +53,12 @@ interface PredictionRow {
   basis_json: string;
   actual_minutes: number | null;
   error_minutes: number | null;
+  finalized_ts: number | null;
   notified_ts: number | null;
 }
 
 const PRED_COLS =
-  "target_date, created_ts, predicted_minutes, probability, window_early, window_late, basis_json, actual_minutes, error_minutes, notified_ts";
+  "target_date, created_ts, predicted_minutes, probability, window_early, window_late, basis_json, actual_minutes, error_minutes, finalized_ts, notified_ts";
 
 function predictionJson(env: Env, r: PredictionRow, withBasis: boolean) {
   const mins = (m: number | null) => (m == null ? null : { minutes: m, time: minsToHHMM(m) });
@@ -75,6 +76,9 @@ function predictionJson(env: Env, r: PredictionRow, withBasis: boolean) {
         : null,
     actual: mins(r.actual_minutes),
     errorMinutes: r.error_minutes,
+    // non-null = the target day is graded; actual:null then means "never ran out",
+    // not "not scored yet" — clients can't tell those apart without this
+    finalizedAt: iso(r.finalized_ts),
     notifiedAt: iso(r.notified_ts),
     ...(withBasis ? { basis: JSON.parse(r.basis_json) as unknown } : {}),
   };

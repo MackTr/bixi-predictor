@@ -34,20 +34,23 @@ effective sample size, the target context it compared against (`basis.target`, i
   "willRunOut": true, "probability": 0.86,
   "predicted": { "minutes": 460, "time": "07:40" },
   "window": { "early": "07:15", "late": "08:05" },
-  "actual": null, "errorMinutes": null, "notifiedAt": "2026-07-11T01:00:06Z",
+  "actual": null, "errorMinutes": null, "finalizedAt": null, "notifiedAt": "2026-07-11T01:00:06Z",
   "basis": { "fallbackLevel": 1, "effectiveN": 5.2, "historyDays": 14,
              "topDays": [ { "date": "2026-07-04", "weight": 0.94, "runoutMinutes": 452, "tempC": 21.3, "precipMm": 0 } ] } }
 ```
 
 ### `GET /stations/{id}/predictions?days=`
 Prediction history, most recent target first (`days` 1–365, default 14), without `basis`. Once a
-target day completes, `actual` and `errorMinutes` (predicted − actual) are filled in — the running
-accuracy record.
+target day completes, `finalizedAt` is set and `actual` / `errorMinutes` (predicted − actual) are
+filled in — the running accuracy record. On a finalized row `actual: null` means the station never
+ran out that day (so a `willRunOut: true` row was a false alarm); on an unfinalized row it just
+means "not scored yet" — that's why clients must key off `finalizedAt`, not `actual`.
 ```json
 { "station": "345", "count": 14, "predictions": [ { "targetDate": "2026-07-10", "willRunOut": true,
   "probability": 0.81, "predicted": { "minutes": 455, "time": "07:35" },
   "window": { "early": "07:20", "late": "07:55" },
-  "actual": { "minutes": 464, "time": "07:44" }, "errorMinutes": -9 } ] }
+  "actual": { "minutes": 464, "time": "07:44" }, "errorMinutes": -9,
+  "finalizedAt": "2026-07-11T01:00:03Z" } ] }
 ```
 
 ### `GET /push/vapid-public-key`
