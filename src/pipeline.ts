@@ -66,14 +66,19 @@ async function loadHistory(env: Env): Promise<DayRecord[]> {
 
 // Fill actual_minutes/error_minutes for every past prediction whose target day
 // now has a complete daily_features row. Not just yesterday's: this self-heals
-// nights the cron missed.
+// nights the cron missed. Today's own prediction is also graded as soon as a
+// run-out is on the books (the day's FIRST transition can't change once it
+// happened) — without this the dashboard would trail every guess by a full day.
+// A no-run-out day still waits for complete=1: "never ran out" isn't known
+// until midnight.
 async function finalizePastPredictions(env: Env, today: string, now: number): Promise<string[]> {
   const res = await env.DB.prepare(
     `SELECT p.target_date AS target_date, p.predicted_minutes AS predicted_minutes, f.runout_minutes AS runout_minutes
      FROM predictions p JOIN daily_features f ON f.date = p.target_date
-     WHERE p.target_date < ? AND p.finalized_ts IS NULL AND f.complete = 1`,
+     WHERE p.finalized_ts IS NULL
+       AND ((p.target_date < ? AND f.complete = 1) OR (p.target_date = ? AND f.runout_minutes IS NOT NULL))`,
   )
-    .bind(today)
+    .bind(today, today)
     .all<{ target_date: string; predicted_minutes: number | null; runout_minutes: number | null }>();
   const rows = res.results ?? [];
   for (const r of rows) {

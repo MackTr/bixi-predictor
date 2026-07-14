@@ -151,7 +151,15 @@ export async function buildPushRequest(
     "Content-Type": "application/octet-stream",
     TTL: String(opts.ttl),
   };
-  if (opts.topic) headers.Topic = opts.topic;
+  // Sent base64url-encoded, defensively: replace-semantics only need a stable
+  // value, and encoding guarantees RFC 8030's charset (and, for ≤24-byte
+  // inputs, its 32-char limit) on every push service. NB: Apple's
+  // "BadWebPushTopic" does NOT mean this header is malformed — it's what they
+  // answer when the VAPID key signing the JWT isn't the key the subscription
+  // was created under (Apple validates the token first; see
+  // scripts/topic-probe.ts, which bisected exactly this in 2026-07 when a
+  // stale pre-key-rotation subscription refused every push).
+  if (opts.topic) headers.Topic = bytesToB64u(utf8(opts.topic));
   if (opts.urgency) headers.Urgency = opts.urgency;
   return { headers, body: await encryptPayload(target, payload) };
 }

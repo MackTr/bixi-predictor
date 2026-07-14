@@ -78,6 +78,11 @@ export async function sendPush(env: Env, sub: StoredSub, payload: NotificationPa
     { ttl: 43200, urgency: "normal", topic: "bixi-tomorrow" },
   );
   const res = await fetch(sub.endpoint, { method: "POST", headers, body });
+  if (!res.ok) {
+    // surfaced by `wrangler tail`: the push service's status+body say exactly
+    // why it refused (bad VAPID JWT, key mismatch, expired subscription, ...)
+    console.log(`push refused ${res.status} ${sub.endpoint.slice(0, 45)}…: ${(await res.text()).slice(0, 300)}`);
+  }
   return { ok: res.ok, status: res.status, gone: res.status === 404 || res.status === 410 };
 }
 
@@ -105,7 +110,8 @@ export async function broadcast(env: Env, payload: NotificationPayload): Promise
         failed++;
         await bumpFailures(env, sub);
       }
-    } catch {
+    } catch (e) {
+      console.log(`push threw for ${sub.endpoint.slice(0, 45)}…: ${e instanceof Error ? e.message : String(e)}`);
       failed++;
       await bumpFailures(env, sub);
     }
