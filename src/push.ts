@@ -53,11 +53,12 @@ export function buildNotification(p: PredictionSummary, today?: TodayComparison)
     body = `${friendlyDate(p.targetDate)} · run-out probability ${Math.round(p.probability * 100)}%.`;
   } else {
     title = `BIXI tomorrow: empty ~${minsToHHMM(p.predictedMinutes)}`;
+    // estimate first, window second (Mack reads the time before anything else)
     const win =
       p.windowEarly != null && p.windowLate != null && p.windowLate > p.windowEarly
-        ? ` likely out ${minsToHHMM(p.windowEarly)}–${minsToHHMM(p.windowLate)}`
-        : ` likely out ~${minsToHHMM(p.predictedMinutes)}`;
-    body = `${friendlyDate(p.targetDate)} ·${win} (${Math.round(p.probability * 100)}%).`;
+        ? ` · window ${minsToHHMM(p.windowEarly)}–${minsToHHMM(p.windowLate)}`
+        : "";
+    body = `Out ~${minsToHHMM(p.predictedMinutes)}${win} (${Math.round(p.probability * 100)}%) · ${friendlyDate(p.targetDate)}.`;
   }
   if (p.startBikes != null) {
     body += ` From ${p.startBikes} bike${p.startBikes === 1 ? "" : "s"} tonight.`;
