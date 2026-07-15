@@ -1,7 +1,7 @@
 # BIXI Predictor — when will station 345 run out?
 
 Nightly run-out prediction for BIXI station 345 (Regina / de Verdun), on Cloudflare Workers + D1.
-Every night at 9pm Montreal time it predicts what time the station will run out of usable bikes
+Every night at 10pm Montreal time it predicts what time the station will run out of usable bikes
 **tomorrow**, stores the prediction with its full reasoning basis, tracks accuracy against what
 actually happened, and sends a Web Push notification to the
 [bixi-monitor](https://github.com/MackTr/bixi-monitor) dashboard installed as a Home-Screen app.
@@ -28,22 +28,37 @@ Each past day gets a weight: the product of four kernels comparing it to tomorro
 
 | kernel | compares | value |
 |---|---|---|
-| day type | weekday vs work/off class | same dow **and** same class 1.0 · same class 0.4 · opposite 0.05 |
-| starting inventory | bikes at 9pm the evening before | gaussian on the difference, σ = 4 bikes |
+| day type | weekday vs work/off class | same dow **and** same class 1.0 · same class 0.25 · opposite 0.05 |
+| starting inventory | bikes at 10pm the evening before | gaussian on the difference, σ = 4 bikes (σ×2 when both evenings were swept) |
+| truck sweep | bikes trucked out 5–10pm the evening before | both/neither swept (≥5 bikes) 1.0 · mismatch 0.4 |
 | temperature | 8am temperature | gaussian on the difference, σ = 5 °C |
 | precipitation | 6–11am rain sum | buckets dry <0.5mm / light / wet >4mm: same 1.0 · adjacent 0.5 · dry↔wet 0.15 |
+| night rain | 8pm–2am rain sum, night before | same buckets as morning precipitation (no probability bump) |
+| night mugginess | 10pm dew point, night before | gaussian on the difference, σ = 3 °C |
 | recency | calendar age | half-life 45 days |
 
 Details that matter:
 
-- **Starting inventory is symmetric by construction**: tomorrow's is tonight's live 9pm count
-  (known at prediction time); a history day's is *its* previous evening's 9pm snapshot. A station
-  sitting at 6 bikes at 9pm gets its estimate pulled toward past days that also started low —
+- **Starting inventory is symmetric by construction**: tomorrow's is tonight's live 10pm count
+  (known at prediction time); a history day's is *its* previous evening's 10pm snapshot. A station
+  sitting at 6 bikes at 10pm gets its estimate pulled toward past days that also started low —
   which ran out earlier. The nightly notification reports the count it reasoned from.
 - **Holidays are off-days**, not excluded: a holiday Monday matches Sundays (class `offday`), never
   working Mondays. Quebec statutory holidays are computed, not maintained ([src/holidays.ts](src/holidays.ts)).
 - **Missing weather is uninformative, not dissimilar** — a null temperature scores kernel 1.0, so a
   day without weather data isn't punished, it's just not weather-matched.
+- **The night before matters as much as the morning**: overnight organic returns (6–23 bikes per
+  night at this station) rebuild the starting inventory after the 10pm snapshot, and they track how
+  inviting the night is. The night kernels make similar nights comparable — a warm dry Saturday
+  night weighs against other lively nights, a rainy Tuesday against other dead ones. The model
+  doesn't assume a direction; the matched days supply it. Dew point over relative humidity because
+  night RH is uniformly high — dew point is what "muggy" means.
+- **A swept 3 is not a drained 3.** BIXI's truck harvests this station most weekday evenings
+  (~19:30, in unmistakable −2/min bursts; `evening_swept` is burst-detected from the monitor's
+  observations, `src/sync.ts`). Swept racks refill organically overnight; the rare organic drain
+  (a lively Saturday night riding everything away) stays low. Same 10pm count, opposite mornings —
+  the sweep kernel keeps those regimes apart, and between two swept evenings the exact count mostly
+  measures how long ago the truck came, hence the widened σ.
 - If tomorrow's rain *sum* looks dry but the forecast **probability** of rain is ≥50%, the dry
   bucket is promoted to light — probability is a forecast-only signal the archives don't have.
 - Days with fewer than 20 observations are excluded entirely (collector gaps — their "never ran
@@ -69,9 +84,11 @@ The effective sample size `n_eff = (Σw)²/Σw²` measures how many days the est
 on. When it's under 3, the model climbs a fallback ladder instead of faking precision:
 
 1. **Level 0** — all kernels active.
-2. **Level 1** — weather kernels dropped (with little data, weather-matching starves the sample);
-   inventory survives, it's too informative to give up early.
-3. **Level 2** — day-type kernel widened (1.0/0.7/0.2) and inventory dropped. If `n_eff` is still
+2. **Level 1** — night kernels dropped (the thinnest signal: one unusual night shouldn't cost the
+   morning kernels too).
+3. **Level 2** — all weather kernels dropped (with little data, weather-matching starves the
+   sample); inventory survives, it's too informative to give up early.
+4. **Level 3** — day-type kernel widened (1.0/0.7/0.2) and inventory dropped. If `n_eff` is still
    under 1, the prediction is published as **"not enough data"** rather than a made-up time.
 
 The level used is stored and shown on the dashboard card, so a vague answer is visibly vague.
@@ -93,13 +110,13 @@ can be audited months later: *these* were the days it reasoned from, weighted *t
 
 ## The nightly pipeline
 
-Both `0 1 * * *` and `0 2 * * *` UTC crons fire; only the one landing at 9pm America/Toronto runs
+Both `0 2 * * *` and `0 3 * * *` UTC crons fire; only the one landing at 10pm America/Toronto runs
 (DST-proof). Steps ([src/pipeline.ts](src/pipeline.ts)), each isolated so one failure can't kill
 the night:
 
 1. **Sync** — pull recent days from the monitor API, digest each into one daily_features row
    (run-out time, observation count). 14-day lookback self-heals missed nights. Today is included
-   as `complete=0`: by 9pm the morning — when run-outs happen — is already history.
+   as `complete=0`: by 10pm the morning — when run-outs happen — is already history.
 2. **Weather** — Open-Meteo (free, no key): actuals for unsettled past days, forecast for tomorrow.
    The forecast API also serves recent-past actuals; the ERA5 archive lags ~5 days and is used only
    for deep backfill.
@@ -108,7 +125,7 @@ the night:
 5. **Push** — RFC 8291 Web Push to every subscription. `notified_ts` guarantees a target date is
    never pushed twice, so re-runs and double-fires are safe.
 
-Two implementation notes with scars behind them: at the 9pm firing the **UTC date is already
+Two implementation notes with scars behind them: at the 10pm firing the **UTC date is already
 tomorrow**, so every date flows through the local-time helpers in [src/tz.ts](src/tz.ts) — never
 `toISOString()`. And the Web Push encryption is **hand-rolled on WebCrypto**
 ([src/webpush.ts](src/webpush.ts)): the npm WebCrypto push libraries still emit the pre-standard
@@ -124,7 +141,7 @@ Appendix A test vector byte-for-byte: `npx tsx scripts/webpush-vector-test.ts`.
 - `src/weather.ts` — Open-Meteo forecast + archive → morning-window aggregates
 - `src/push.ts` + `src/webpush.ts` — Web Push: hand-rolled VAPID + aes128gcm (RFC 8291)
 - `src/api.ts` — `/api/v1` router + CORS
-- `src/worker.ts` — `scheduled()` (9pm local guard) + `fetch()` entrypoint
+- `src/worker.ts` — `scheduled()` (10pm local guard) + `fetch()` entrypoint
 
 ## Develop locally
 

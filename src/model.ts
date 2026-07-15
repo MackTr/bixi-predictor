@@ -4,9 +4,10 @@
 // prediction can be stored and inspected.
 //
 // Each history day is weighted by how much it resembles tomorrow (day type,
-// morning temperature, morning precipitation) and how recent it is. The
-// probability of running out is the weighted share of similar days that did;
-// the predicted time is the weighted median of when they did.
+// morning temperature, morning precipitation, the character of the night
+// before) and how recent it is. The probability of running out is the weighted
+// share of similar days that did; the predicted time is the weighted median of
+// when they did.
 
 export interface DayRecord {
   date: string; // local YYYY-MM-DD
@@ -15,7 +16,13 @@ export interface DayRecord {
   runoutMinutes: number | null; // null = never ran out that day
   tempC: number | null; // 08:00 temperature
   precipMm: number | null; // 06:00-11:00 precipitation sum
-  startBikes: number | null; // bikes at 9pm the evening before — the day's starting inventory
+  startBikes: number | null; // bikes at 10pm the evening before — the day's starting inventory
+  sweptEvening: number | null; // bikes trucked out 17:00-22:00 the evening before
+  // The night leading into this day's morning (evening before, 20:00-02:00):
+  // overnight organic returns dominate the morning inventory, and they track
+  // how inviting the night was.
+  nightPrecipMm: number | null;
+  nightDewC: number | null; // 22:00 dew point — mugginess
   complete: boolean;
   obsCount: number;
 }
@@ -28,6 +35,9 @@ export interface TargetContext {
   precipMm: number | null;
   precipProb: number | null; // forecast-only signal, promotes a dry mm bucket
   startBikes: number | null; // bikes right now — what tomorrow morning starts from
+  sweptEvening: number | null; // bikes trucked out this evening (17:00-22:00)
+  nightPrecipMm: number | null; // tonight, 20:00-02:00 (forecast past 10pm)
+  nightDewC: number | null; // tonight's 22:00 dew point
 }
 
 export interface WeightedDay {
@@ -37,10 +47,15 @@ export interface WeightedDay {
   tempC: number | null;
   precipMm: number | null;
   startBikes: number | null;
+  sweptEvening: number | null;
+  nightPrecipMm: number | null;
+  nightDewC: number | null;
 }
 
 export interface PredictionBasis {
-  fallbackLevel: 0 | 1 | 2; // 0 = full kernels, 1 = weather dropped, 2 = day-type widened + inventory dropped
+  // 0 = full kernels, 1 = night kernels dropped, 2 = all weather dropped,
+  // 3 = day-type widened + inventory dropped
+  fallbackLevel: 0 | 1 | 2 | 3;
   effectiveWeight: number; // sum of weights
   effectiveN: number; // (sum w)^2 / sum w^2 — "how many days is this really"
   historyDays: number; // records that passed the obs_count gate
@@ -59,8 +74,14 @@ export interface Prediction {
 }
 
 export const PARAMS = {
+  dayTypeSameClass: 0.25, // same work/off class, different weekday (same dow+class is 1.0)
+  dayTypeOpposite: 0.05,
   tempSigmaC: 5,
   bikesSigma: 4, // starting-inventory kernel width, in bikes (capacity is 19)
+  sweptMinBikes: 5, // >= this many bikes trucked out 5-10pm = a "swept" evening
+  sweptMismatch: 0.4, // swept vs organic evenings tell opposite stories
+  sweptSigmaFactor: 2, // both swept -> the 10pm count is cycle-phase noise, widen bikes sigma
+  nightDewSigmaC: 3, // night-mugginess kernel width (22:00 dew point)
   recencyHalfLifeDays: 45,
   dryMaxMm: 0.5, // precip buckets over the morning-window sum
   wetMinMm: 4,
@@ -75,11 +96,19 @@ const isOffday = (dow: number, holiday: boolean) => holiday || dow === 0 || dow 
 
 // Same weekday only counts fully when it's also the same work/off class — a
 // holiday Monday behaves like a Sunday, not like a working Monday.
-function dayTypeKernel(d: DayRecord, t: TargetContext, widened: boolean): number {
+function dayTypeKernel(d: DayRecord, t: TargetContext, widened: boolean, p: Params): number {
   const sameClass = isOffday(d.dow, d.isHoliday) === isOffday(t.dow, t.isHoliday);
   const sameDow = d.dow === t.dow;
   if (widened) return sameDow && sameClass ? 1.0 : sameClass ? 0.7 : 0.2;
-  return sameDow && sameClass ? 1.0 : sameClass ? 0.4 : 0.05;
+  return sameDow && sameClass ? 1.0 : sameClass ? p.dayTypeSameClass : p.dayTypeOpposite;
+}
+
+// Swept evenings (truck harvested the rack 5-10pm) and organic evenings tell
+// opposite stories about the same low count: swept racks refill organically
+// overnight, organically-drained racks stay low. Match the regime.
+function sweptKernel(a: number | null, b: number | null, p: Params): number {
+  if (a == null || b == null) return 1;
+  return a >= p.sweptMinBikes === b >= p.sweptMinBikes ? 1 : p.sweptMismatch;
 }
 
 // Gaussian similarity on a numeric feature (temperature, starting inventory).
@@ -104,6 +133,17 @@ function precipKernel(d: DayRecord, t: TargetContext, p: Params): number {
   return diff === 0 ? 1 : diff === 1 ? 0.5 : 0.15;
 }
 
+// Same buckets for the night-before rain (no probability bump — that's a
+// morning-window signal). A rainy night suppresses the overnight returns that
+// rebuild the starting inventory.
+function nightPrecipKernel(d: DayRecord, t: TargetContext, p: Params): number {
+  const bd = precipBucket(d.nightPrecipMm, p);
+  const bt = precipBucket(t.nightPrecipMm, p);
+  if (bd == null || bt == null) return 1;
+  const diff = Math.abs(bd - bt);
+  return diff === 0 ? 1 : diff === 1 ? 0.5 : 0.15;
+}
+
 // Weighted quantile over runout times: first value whose cumulative weight
 // reaches q of the total.
 function weightedQuantile(items: { v: number; w: number }[], q: number): number {
@@ -120,35 +160,47 @@ function weightedQuantile(items: { v: number; w: number }[], q: number): number 
 export function predict(history: DayRecord[], target: TargetContext, params: Params = PARAMS): Prediction {
   const usable = history.filter((d) => d.obsCount >= params.minObsCount && d.date < target.date);
 
-  const weigh = (level: 0 | 1 | 2) =>
+  const weigh = (level: 0 | 1 | 2 | 3) =>
     usable.map((d) => {
-      let w = dayTypeKernel(d, target, level === 2);
+      let w = dayTypeKernel(d, target, level === 3, params);
       if (level === 0) {
+        w *= nightPrecipKernel(d, target, params);
+        w *= gaussianKernel(d.nightDewC, target.nightDewC, params.nightDewSigmaC);
+      }
+      if (level <= 1) {
         w *= gaussianKernel(d.tempC, target.tempC, params.tempSigmaC);
         w *= precipKernel(d, target, params);
       }
-      // Starting inventory is a strong signal (a station at 6 bikes at 9pm runs
-      // out earlier than a full one), so it survives level 1 and is only dropped
-      // in the last-resort widening at level 2.
-      if (level <= 1) w *= gaussianKernel(d.startBikes, target.startBikes, params.bikesSigma);
+      // Starting inventory is a strong signal (a station at 6 bikes at 10pm runs
+      // out earlier than a full one), so it survives level 2 and is only dropped
+      // in the last-resort widening at level 3. When BOTH evenings were swept,
+      // the count mostly reflects how long ago the truck came — widen sigma.
+      if (level <= 2) {
+        w *= sweptKernel(d.sweptEvening, target.sweptEvening, params);
+        const bothSwept =
+          d.sweptEvening != null &&
+          target.sweptEvening != null &&
+          d.sweptEvening >= params.sweptMinBikes &&
+          target.sweptEvening >= params.sweptMinBikes;
+        const sigma = bothSwept ? params.bikesSigma * params.sweptSigmaFactor : params.bikesSigma;
+        w *= gaussianKernel(d.startBikes, target.startBikes, sigma);
+      }
       w *= Math.pow(0.5, dayDiffDays(d.date, target.date) / params.recencyHalfLifeDays);
       return { d, w };
     });
 
   // Cold-start ladder: with little history the weather kernels can starve the
-  // sample, so drop them first, then widen the day-type kernel. Whatever level
-  // first reaches a usable effective sample wins; the level is reported.
-  let level: 0 | 1 | 2 = 0;
+  // sample. Shed the night kernels first (the thinnest signal — an unusual
+  // night shouldn't cost the morning kernels too), then all weather, then widen
+  // the day-type kernel. Whatever level first reaches a usable effective sample
+  // wins; the level is reported.
+  let level: 0 | 1 | 2 | 3 = 0;
   let weighted = weigh(0);
   let nEff = effectiveN(weighted);
-  if (nEff < params.minEffectiveN) {
-    level = 1;
-    weighted = weigh(1);
-    nEff = effectiveN(weighted);
-  }
-  if (nEff < params.minEffectiveN) {
-    level = 2;
-    weighted = weigh(2);
+  for (const next of [1, 2, 3] as const) {
+    if (nEff >= params.minEffectiveN) break;
+    level = next;
+    weighted = weigh(next);
     nEff = effectiveN(weighted);
   }
 
@@ -163,6 +215,9 @@ export function predict(history: DayRecord[], target: TargetContext, params: Par
       tempC: d.tempC,
       precipMm: d.precipMm,
       startBikes: d.startBikes,
+      sweptEvening: d.sweptEvening,
+      nightPrecipMm: d.nightPrecipMm,
+      nightDewC: d.nightDewC,
     }));
 
   const basis: PredictionBasis = {

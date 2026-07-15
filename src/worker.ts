@@ -27,13 +27,13 @@ export default {
     });
   },
 
-  // Both UTC crons (01:00 and 02:00) fire year-round; only the one landing at
-  // 9pm Montreal time does work, which keeps the schedule DST-proof. Errors are
+  // Both UTC crons (02:00 and 03:00) fire year-round; only the one landing at
+  // 10pm Montreal time does work, which keeps the schedule DST-proof. Errors are
   // logged, never thrown, so one bad night can't wedge the schedule.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const hour = localParts(Math.floor(Date.now() / 1000), TZ).hour;
-    if (hour !== 21) {
-      console.log(`cron skipped (local hour ${hour} != 21)`);
+    if (hour !== 22) {
+      console.log(`cron skipped (local hour ${hour} != 22)`);
       return;
     }
     ctx.waitUntil(

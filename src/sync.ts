@@ -19,6 +19,7 @@ export interface SyncedDay {
   obsCount: number;
   complete: boolean;
   eveningBikes: number | null;
+  eveningSwept: number | null; // bikes trucked out 17:00-22:00 (burst-detected)
 }
 
 // workers.dev blocks worker→worker fetches within one account, so production
@@ -49,7 +50,7 @@ export async function fetchObservations(env: Env, fromEpoch: number, toEpoch: nu
 
 // Dates in [today - lookbackDays, today] that are missing or were synced before
 // their day ended. Yesterday and today always qualify (today is always fresh;
-// yesterday was complete=0 when synced at 9pm yesterday).
+// yesterday was complete=0 when synced at 10pm yesterday).
 export async function datesNeedingSync(env: Env, lookbackDays: number, today: string): Promise<string[]> {
   const from = addDays(today, -lookbackDays);
   const res = await env.DB.prepare(`SELECT date FROM daily_features WHERE date >= ? AND date <= ? AND complete = 1`)
@@ -92,14 +93,33 @@ export async function syncDays(env: Env, dates: string[], now: number): Promise<
     if (to <= from) continue;
     const rows = await fetchObservations(env, from, to);
 
-    // 21:00 snapshot per date: last observed value at or before 9pm (step-held).
+    // 22:00 snapshot per date: last observed value at or before 10pm (step-held).
     const eveningEpochs = run.map((d) => {
       const [y, m, dd] = d.split("-").map(Number);
-      return wallToEpoch(y, m, dd, 21, 0, TZ);
+      return wallToEpoch(y, m, dd, 22, 0, TZ);
+    });
+    const sweepWindowStarts = run.map((d) => {
+      const [y, m, dd] = d.split("-").map(Number);
+      return wallToEpoch(y, m, dd, 17, 0, TZ);
     });
     const state = new Map(
-      run.map((d) => [d, { runoutEpoch: null as number | null, obs: 0, eveningBikes: null as number | null }]),
+      run.map((d) => [
+        d,
+        { runoutEpoch: null as number | null, obs: 0, eveningBikes: null as number | null, swept: 0 },
+      ]),
     );
+
+    // Truck bursts: consecutive same-direction changes <=5min apart. Trucks
+    // load/unload ~2 bikes a minute; organic trips are isolated +-1..3. A burst
+    // removing >=5 bikes that starts inside a date's 17:00-22:00 window counts
+    // toward that evening's sweep total.
+    let burst: { dir: 1 | -1; sum: number; startTs: number; lastTs: number } | null = null;
+    const closeBurst = () => {
+      if (!burst || burst.sum > -5) return;
+      const i = sweepWindowStarts.findIndex((s, j) => burst!.startTs >= s && burst!.startTs <= eveningEpochs[j]);
+      if (i >= 0) state.get(run[i])!.swept += -burst.sum;
+    };
+
     let prev: number | null = null;
     let di = -1; // index into run; -1 = still in the 2h lead-in
     for (const r of rows) {
@@ -110,8 +130,20 @@ export async function syncDays(env: Env, dates: string[], now: number): Promise<
         if (prev != null && prev > 0 && r.bikes <= 0 && st.runoutEpoch == null) st.runoutEpoch = r.ts;
         if (r.ts <= eveningEpochs[di]) st.eveningBikes = r.bikes;
       }
+      if (prev != null && r.bikes !== prev) {
+        const delta = r.bikes - prev;
+        const dir = delta > 0 ? (1 as const) : (-1 as const);
+        if (burst && burst.dir === dir && r.ts - burst.lastTs <= 300) {
+          burst.sum += delta;
+          burst.lastTs = r.ts;
+        } else {
+          closeBurst();
+          burst = { dir, sum: delta, startTs: r.ts, lastTs: r.ts };
+        }
+      }
       prev = r.bikes;
     }
+    closeBurst();
 
     for (const date of run) {
       const st = state.get(date)!;
@@ -123,9 +155,11 @@ export async function syncDays(env: Env, dates: string[], now: number): Promise<
             })()
           : null;
       const complete = date < today;
+      // swept is only meaningful when the walk actually saw observations
+      const swept = st.obs > 0 ? st.swept : null;
       await env.DB.prepare(
-        `INSERT INTO daily_features (date, dow, is_holiday, runout_minutes, obs_count, complete, evening_bikes, synced_ts)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO daily_features (date, dow, is_holiday, runout_minutes, obs_count, complete, evening_bikes, evening_swept, synced_ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(date) DO UPDATE SET
            dow = excluded.dow,
            is_holiday = excluded.is_holiday,
@@ -133,11 +167,12 @@ export async function syncDays(env: Env, dates: string[], now: number): Promise<
            obs_count = excluded.obs_count,
            complete = excluded.complete,
            evening_bikes = COALESCE(excluded.evening_bikes, daily_features.evening_bikes),
+           evening_swept = COALESCE(excluded.evening_swept, daily_features.evening_swept),
            synced_ts = excluded.synced_ts`,
       )
-        .bind(date, dowOf(date), holidayName(date) ? 1 : 0, runoutMinutes, st.obs, complete ? 1 : 0, st.eveningBikes, now)
+        .bind(date, dowOf(date), holidayName(date) ? 1 : 0, runoutMinutes, st.obs, complete ? 1 : 0, st.eveningBikes, swept, now)
         .run();
-      out.push({ date, runoutMinutes, obsCount: st.obs, complete, eveningBikes: st.eveningBikes });
+      out.push({ date, runoutMinutes, obsCount: st.obs, complete, eveningBikes: st.eveningBikes, eveningSwept: swept });
     }
   }
   return out;

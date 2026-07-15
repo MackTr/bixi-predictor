@@ -26,7 +26,7 @@ export interface PredictionSummary {
   predictedMinutes: number | null;
   windowEarly: number | null;
   windowLate: number | null;
-  startBikes?: number | null; // tonight's 9pm inventory, when known
+  startBikes?: number | null; // tonight's 10pm inventory, when known
 }
 
 export interface TodayComparison {

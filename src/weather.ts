@@ -9,7 +9,7 @@
 // PRECEDING-hour sum: the 06:00-11:00 window = labels 07:00..11:00.
 
 import type { Env } from "./worker";
-import { TZ, dayDiff } from "./tz";
+import { TZ, addDays, dayDiff } from "./tz";
 
 const FORECAST_URL = "https://api.open-meteo.com/v1/forecast";
 const ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive";
@@ -20,6 +20,10 @@ export interface MorningWeather {
   precipMm: number | null; // precipitation sum 06:00-11:00
   precipProb: number | null; // max precipitation_probability 06:00-11:00
   windKmh: number | null; // max wind_speed_10m 06:00-11:00
+  // The night FOLLOWING this date's 10pm snapshot (20:00 through 02:00 next
+  // day) — drives overnight organic returns, so day D+1's morning inventory.
+  nightPrecipMm: number | null; // precipitation sum 20:00-02:00(+1)
+  nightDewC: number | null; // dew_point_2m at 22:00
 }
 
 interface OpenMeteoHourly {
@@ -28,10 +32,11 @@ interface OpenMeteoHourly {
   precipitation?: (number | null)[];
   precipitation_probability?: (number | null)[];
   wind_speed_10m?: (number | null)[];
+  dew_point_2m?: (number | null)[];
 }
 
 async function fetchHourly(base: string, env: Env, startDate: string, endDate: string, withProb: boolean): Promise<OpenMeteoHourly> {
-  const vars = ["temperature_2m", "precipitation", "wind_speed_10m"];
+  const vars = ["temperature_2m", "precipitation", "wind_speed_10m", "dew_point_2m"];
   if (withProb) vars.push("precipitation_probability");
   const u = new URL(base);
   u.searchParams.set("latitude", env.STATION_LAT);
@@ -48,6 +53,10 @@ async function fetchHourly(base: string, env: Env, startDate: string, endDate: s
 }
 
 const MORNING_LABELS = ["07:00", "08:00", "09:00", "10:00", "11:00"];
+// Hourly precipitation is the PRECEDING-hour sum, so 20:00-02:00(+1) = labels
+// 21:00..23:00 of the date plus 00:00..02:00 of the next day.
+const NIGHT_LABELS = ["21:00", "22:00", "23:00"];
+const NIGHT_LABELS_NEXT = ["00:00", "01:00", "02:00"];
 
 export function aggregateMorning(hourly: OpenMeteoHourly, dates: string[]): Map<string, MorningWeather> {
   const idx = new Map<string, number>();
@@ -61,6 +70,7 @@ export function aggregateMorning(hourly: OpenMeteoHourly, dates: string[]): Map<
     let precip: number | null = null;
     let prob: number | null = null;
     let wind: number | null = null;
+    let nightPrecip: number | null = null;
     for (const hh of MORNING_LABELS) {
       const p = at(date, hh, hourly.precipitation);
       if (p != null) precip = (precip ?? 0) + p;
@@ -69,14 +79,30 @@ export function aggregateMorning(hourly: OpenMeteoHourly, dates: string[]): Map<
       const w = at(date, hh, hourly.wind_speed_10m);
       if (w != null) wind = Math.max(wind ?? 0, w);
     }
-    out.set(date, { tempC: at(date, "08:00", hourly.temperature_2m), precipMm: precip, precipProb: prob, windKmh: wind });
+    const next = addDays(date, 1);
+    for (const [d, hh] of [
+      ...NIGHT_LABELS.map((hh) => [date, hh]),
+      ...NIGHT_LABELS_NEXT.map((hh) => [next, hh]),
+    ]) {
+      const p = at(d, hh, hourly.precipitation);
+      if (p != null) nightPrecip = (nightPrecip ?? 0) + p;
+    }
+    out.set(date, {
+      tempC: at(date, "08:00", hourly.temperature_2m),
+      precipMm: precip,
+      precipProb: prob,
+      windKmh: wind,
+      nightPrecipMm: nightPrecip,
+      nightDewC: at(date, "22:00", hourly.dew_point_2m),
+    });
   }
   return out;
 }
 
 export async function fetchForecast(env: Env, dates: string[]): Promise<Map<string, MorningWeather>> {
   const sorted = [...dates].sort();
-  const hourly = await fetchHourly(FORECAST_URL, env, sorted[0], sorted[sorted.length - 1], true);
+  // End one day past the last date: the night window spills into the next day.
+  const hourly = await fetchHourly(FORECAST_URL, env, sorted[0], addDays(sorted[sorted.length - 1], 1), true);
   return aggregateMorning(hourly, sorted);
 }
 
@@ -89,7 +115,7 @@ export async function fetchActuals(env: Env, dates: string[], today: string): Pr
   const out = new Map<string, MorningWeather>();
 
   if (older.length) {
-    const hourly = await fetchHourly(ARCHIVE_URL, env, older[0], older[older.length - 1], false);
+    const hourly = await fetchHourly(ARCHIVE_URL, env, older[0], addDays(older[older.length - 1], 1), false);
     const agg = aggregateMorning(hourly, older);
     const missing: string[] = [];
     for (const [date, w] of agg) {
@@ -111,22 +137,24 @@ export async function fetchActuals(env: Env, dates: string[], today: string): Pr
 export async function upsertWeather(env: Env, date: string, kind: "actual" | "forecast", w: MorningWeather, now: number): Promise<void> {
   // COALESCE keeps a forecast's precip_prob when the actual (archive) has none.
   await env.DB.prepare(
-    `INSERT INTO weather_daily (date, kind, temp_c, precip_mm, precip_prob, wind_kmh, fetched_ts)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO weather_daily (date, kind, temp_c, precip_mm, precip_prob, wind_kmh, night_precip_mm, night_dew_c, fetched_ts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(date) DO UPDATE SET
        kind = excluded.kind,
        temp_c = excluded.temp_c,
        precip_mm = excluded.precip_mm,
        precip_prob = COALESCE(excluded.precip_prob, weather_daily.precip_prob),
        wind_kmh = excluded.wind_kmh,
+       night_precip_mm = excluded.night_precip_mm,
+       night_dew_c = excluded.night_dew_c,
        fetched_ts = excluded.fetched_ts`,
   )
-    .bind(date, kind, w.tempC, w.precipMm, w.precipProb, w.windKmh, now)
+    .bind(date, kind, w.tempC, w.precipMm, w.precipProb, w.windKmh, w.nightPrecipMm, w.nightDewC, now)
     .run();
 }
 
 // Dates whose weather is still a forecast (or missing entirely) — these get
-// re-fetched as actuals until they settle. Includes today: by the 9pm run the
+// re-fetched as actuals until they settle. Includes today: by the 10pm run the
 // morning window is long past, and today's row feeds the model tonight.
 export async function datesNeedingActuals(env: Env, today: string): Promise<string[]> {
   const res = await env.DB.prepare(

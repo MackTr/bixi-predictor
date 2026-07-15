@@ -1,9 +1,9 @@
-// Nightly orchestration. CRITICAL DATE RULE: the cron fires at 01:00/02:00 UTC,
+// Nightly orchestration. CRITICAL DATE RULE: the cron fires at 02:00/03:00 UTC,
 // when the UTC calendar date is already *tomorrow* in Montreal terms. Every date
 // below must flow from localToday()/addDays() — never from toISOString() or any
 // UTC-derived Date field.
 //
-// Every step is individually try/caught: a monitor outage at 9pm still yields a
+// Every step is individually try/caught: a monitor outage at 10pm still yields a
 // prediction from existing facts, and a missed night self-heals the next one
 // (14-day sync lookback, weather re-fetch of forecast-kind rows, finalization of
 // ALL unfinalized past predictions).
@@ -38,17 +38,22 @@ interface FeatureRow {
   temp_c: number | null;
   precip_mm: number | null;
   start_bikes: number | null;
+  swept_evening: number | null;
+  night_precip_mm: number | null;
+  night_dew_c: number | null;
 }
 
 async function loadHistory(env: Env): Promise<DayRecord[]> {
-  // A day starts its morning from the PREVIOUS evening's 9pm inventory — hence
-  // the self-join on date-1.
+  // A day starts its morning from the PREVIOUS evening's 10pm inventory and the
+  // night that followed it — hence the self-join and weather join on date-1.
   const res = await env.DB.prepare(
     `SELECT f.date, f.dow, f.is_holiday, f.runout_minutes, f.obs_count, f.complete,
-            w.temp_c, w.precip_mm, p.evening_bikes AS start_bikes
+            w.temp_c, w.precip_mm, p.evening_bikes AS start_bikes, p.evening_swept AS swept_evening,
+            wn.night_precip_mm, wn.night_dew_c
      FROM daily_features f
      LEFT JOIN weather_daily w ON w.date = f.date
      LEFT JOIN daily_features p ON p.date = date(f.date, '-1 day')
+     LEFT JOIN weather_daily wn ON wn.date = date(f.date, '-1 day')
      ORDER BY f.date ASC`,
   ).all<FeatureRow>();
   return (res.results ?? []).map((r) => ({
@@ -59,6 +64,9 @@ async function loadHistory(env: Env): Promise<DayRecord[]> {
     tempC: r.temp_c,
     precipMm: r.precip_mm,
     startBikes: r.start_bikes,
+    sweptEvening: r.swept_evening,
+    nightPrecipMm: r.night_precip_mm,
+    nightDewC: r.night_dew_c,
     complete: !!r.complete,
     obsCount: r.obs_count,
   }));
@@ -97,11 +105,15 @@ export async function buildAndStorePrediction(env: Env, targetDate: string, now:
   const weather = await env.DB.prepare(`SELECT temp_c, precip_mm, precip_prob FROM weather_daily WHERE date = ?`)
     .bind(targetDate)
     .first<{ temp_c: number | null; precip_mm: number | null; precip_prob: number | null }>();
-  // Tomorrow starts from tonight's inventory — today's 9pm snapshot, captured by
-  // the sync step that just ran.
-  const tonight = await env.DB.prepare(`SELECT evening_bikes FROM daily_features WHERE date = ?`)
+  // Tomorrow starts from tonight's inventory — today's 10pm snapshot, captured by
+  // the sync step that just ran — and tonight's night weather (today's row;
+  // hours past 10pm are forecast values from the same refetch).
+  const tonight = await env.DB.prepare(`SELECT evening_bikes, evening_swept FROM daily_features WHERE date = ?`)
     .bind(addDays(targetDate, -1))
-    .first<{ evening_bikes: number | null }>();
+    .first<{ evening_bikes: number | null; evening_swept: number | null }>();
+  const tonightWx = await env.DB.prepare(`SELECT night_precip_mm, night_dew_c FROM weather_daily WHERE date = ?`)
+    .bind(addDays(targetDate, -1))
+    .first<{ night_precip_mm: number | null; night_dew_c: number | null }>();
   const target: TargetContext = {
     date: targetDate,
     dow: dowOf(targetDate),
@@ -110,6 +122,9 @@ export async function buildAndStorePrediction(env: Env, targetDate: string, now:
     precipMm: weather?.precip_mm ?? null,
     precipProb: weather?.precip_prob ?? null,
     startBikes: tonight?.evening_bikes ?? null,
+    sweptEvening: tonight?.evening_swept ?? null,
+    nightPrecipMm: tonightWx?.night_precip_mm ?? null,
+    nightDewC: tonightWx?.night_dew_c ?? null,
   };
   const prediction = predict(history, target);
   await env.DB.prepare(

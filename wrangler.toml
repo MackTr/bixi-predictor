@@ -2,11 +2,11 @@ name = "bixi-predictor"
 main = "src/worker.ts"
 compatibility_date = "2025-01-01"
 
-# 9pm America/Toronto is 01:00 UTC during EDT and 02:00 UTC during EST. Both
+# 10pm America/Toronto is 02:00 UTC during EDT and 03:00 UTC during EST. Both
 # crons fire year-round; scheduled() runs the pipeline only when the local hour
-# is 21, so exactly one firing does work each night (DST-proof).
+# is 22, so exactly one firing does work each night (DST-proof).
 [triggers]
-crons = ["0 1 * * *", "0 2 * * *"]
+crons = ["0 2 * * *", "0 3 * * *"]
 
 # D1 (SQLite). For local dev wrangler uses a local copy and ignores database_id.
 # Before `wrangler deploy`: run `wrangler d1 create bixi_predictor` and paste the
